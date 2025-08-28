@@ -1,0 +1,236 @@
+name: Sync Fork with Upstream
+
+on:
+  schedule:
+    # Run weekly on Sundays at 6:00 AM UTC to check for upstream changes
+    - cron: "0 6 * * 0"
+  workflow_dispatch: # Allow manual triggering
+    inputs:
+      force_sync:
+        description: "Force sync even if no changes detected"
+        required: false
+        default: "false"
+        type: boolean
+      target_branch:
+        description: "Target branch to sync (default: main/master)"
+        required: false
+        default: ""
+        type: string
+
+env:
+  UPSTREAM_REPO: "mbadolato/iTerm2-Color-Schemes"
+  UPSTREAM_BRANCH: "master" # The upstream's default branch
+
+jobs:
+  sync-fork:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout fork repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0 # Fetch full history for proper syncing
+          ref: ${{ github.event.inputs.target_branch || github.ref_name }}
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream remote
+        run: |
+          # Check if upstream remote already exists
+          if git remote get-url upstream &>/dev/null; then
+            echo "Upstream remote already exists, updating URL..."
+            git remote set-url upstream https://github.com/${{ env.UPSTREAM_REPO }}.git
+          else
+            echo "Adding upstream remote..."
+            git remote add upstream https://github.com/${{ env.UPSTREAM_REPO }}.git
+          fi
+
+          # Verify remotes
+          echo "Configured remotes:"
+          git remote -v
+
+      - name: Fetch upstream changes
+        run: |
+          echo "Fetching upstream changes from ${{ env.UPSTREAM_REPO }}..."
+          git fetch upstream
+          git fetch origin
+
+          echo "Latest commits on upstream/${{ env.UPSTREAM_BRANCH }}:"
+          git log upstream/${{ env.UPSTREAM_BRANCH }} --oneline -5
+
+      - name: Check for differences
+        id: check_diff
+        run: |
+          CURRENT_BRANCH="${{ github.event.inputs.target_branch || github.ref_name }}"
+          echo "current_branch=$CURRENT_BRANCH" >> $GITHUB_OUTPUT
+
+          # Compare local branch with upstream
+          if git diff --quiet origin/$CURRENT_BRANCH upstream/${{ env.UPSTREAM_BRANCH }}; then
+            echo "has_changes=false" >> $GITHUB_OUTPUT
+            echo "✅ Fork is already up to date with upstream"
+          else
+            echo "has_changes=true" >> $GITHUB_OUTPUT
+            echo "🔄 Changes detected in upstream repository"
+            
+            # Show summary of changes
+            echo "📊 Change summary:"
+            git diff --stat origin/$CURRENT_BRANCH upstream/${{ env.UPSTREAM_BRANCH }}
+          fi
+
+          # Get commit counts
+          BEHIND_COUNT=$(git rev-list --count origin/$CURRENT_BRANCH..upstream/${{ env.UPSTREAM_BRANCH }})
+          AHEAD_COUNT=$(git rev-list --count upstream/${{ env.UPSTREAM_BRANCH }}..origin/$CURRENT_BRANCH)
+
+          echo "behind_count=$BEHIND_COUNT" >> $GITHUB_OUTPUT
+          echo "ahead_count=$AHEAD_COUNT" >> $GITHUB_OUTPUT
+          echo "📈 Fork status: $AHEAD_COUNT commits ahead, $BEHIND_COUNT commits behind upstream"
+
+      - name: Handle conflicts check
+        id: conflict_check
+        if: steps.check_diff.outputs.has_changes == 'true' || github.event.inputs.force_sync == 'true'
+        run: |
+          CURRENT_BRANCH="${{ steps.check_diff.outputs.current_branch }}"
+
+          # Check if we can merge cleanly
+          echo "🔍 Checking for potential merge conflicts..."
+
+          # Try a test merge to see if there are conflicts
+          git checkout -b temp-merge-test
+
+          if git merge upstream/${{ env.UPSTREAM_BRANCH }} --no-commit --no-ff; then
+            echo "merge_strategy=fast-forward" >> $GITHUB_OUTPUT
+            echo "✅ Clean merge possible"
+            git merge --abort 2>/dev/null || true
+          else
+            echo "merge_strategy=manual" >> $GITHUB_OUTPUT
+            echo "⚠️ Merge conflicts detected - will require manual resolution"
+            git merge --abort 2>/dev/null || true
+          fi
+
+          # Clean up test branch
+          git checkout $CURRENT_BRANCH
+          git branch -D temp-merge-test
+
+      - name: Sync fork (Clean Merge)
+        if: (steps.check_diff.outputs.has_changes == 'true' || github.event.inputs.force_sync == 'true') && steps.conflict_check.outputs.merge_strategy == 'fast-forward'
+        run: |
+          CURRENT_BRANCH="${{ steps.check_diff.outputs.current_branch }}"
+          echo "🚀 Performing clean sync with upstream..."
+
+          # Merge upstream changes
+          git merge upstream/${{ env.UPSTREAM_BRANCH }} --ff-only --no-edit
+
+          echo "✅ Successfully merged upstream changes"
+
+          # Push changes to origin
+          git push origin $CURRENT_BRANCH
+
+          echo "🎉 Fork has been successfully synced with upstream!"
+
+      - name: Create Pull Request for Conflicts
+        if: (steps.check_diff.outputs.has_changes == 'true' || github.event.inputs.force_sync == 'true') && steps.conflict_check.outputs.merge_strategy == 'manual'
+        run: |
+          CURRENT_BRANCH="${{ steps.check_diff.outputs.current_branch }}"
+          SYNC_BRANCH="upstream-sync-$(date +%Y%m%d-%H%M%S)"
+
+          echo "⚠️ Merge conflicts detected. Creating PR for manual resolution..."
+
+          # Create a new branch for the sync
+          git checkout -b $SYNC_BRANCH
+
+          # Attempt merge and leave conflicts for manual resolution
+          git merge upstream/${{ env.UPSTREAM_BRANCH }} --no-edit || true
+
+          # Add conflicted files
+          git add .
+          git commit -m "Sync with upstream: merge conflicts need resolution
+
+          This automated sync detected conflicts that require manual resolution.
+
+          Upstream: ${{ env.UPSTREAM_REPO }}@${{ env.UPSTREAM_BRANCH }}
+          Commits behind: ${{ steps.check_diff.outputs.behind_count }}
+          Commits ahead: ${{ steps.check_diff.outputs.ahead_count }}
+
+          Please resolve conflicts and complete the merge."
+
+          # Push the sync branch
+          git push origin $SYNC_BRANCH
+
+          # Create PR using GitHub CLI
+          gh pr create \
+            --title "🔄 Sync with upstream (${{ env.UPSTREAM_REPO }})" \
+            --body "## Automated Upstream Sync
+
+          This PR was automatically created to sync with upstream changes from [\`${{ env.UPSTREAM_REPO }}\`](https://github.com/${{ env.UPSTREAM_REPO }}).
+
+          ### Status
+          - **Upstream Repository:** ${{ env.UPSTREAM_REPO }}
+          - **Upstream Branch:** ${{ env.UPSTREAM_BRANCH }}
+          - **Commits Behind:** ${{ steps.check_diff.outputs.behind_count }}
+          - **Commits Ahead:** ${{ steps.check_diff.outputs.ahead_count }}
+          - **Conflicts:** ⚠️ **Manual resolution required**
+
+          ### What to do
+          1. Review the conflicted files
+          2. Resolve merge conflicts manually
+          3. Test the changes
+          4. Merge this PR when ready
+
+          ### Recent Upstream Changes
+          \`\`\`
+          $(git log upstream/${{ env.UPSTREAM_BRANCH }} --oneline -10)
+          \`\`\`
+
+          ---
+          *This PR was created automatically by the sync-fork workflow.*" \
+            --head $SYNC_BRANCH \
+            --base $CURRENT_BRANCH \
+            --label "upstream-sync" \
+            --label "merge-conflicts"
+
+          echo "📝 Created pull request for manual conflict resolution"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create workflow summary
+        if: always()
+        run: |
+          echo "## 🔄 Fork Sync Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Repository:** ${{ github.repository }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Upstream:** ${{ env.UPSTREAM_REPO }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Branch:** ${{ steps.check_diff.outputs.current_branch }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Triggered:** ${{ github.event_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          if [ "${{ steps.check_diff.outputs.has_changes }}" == "true" ]; then
+            echo "### 📊 Changes Detected" >> $GITHUB_STEP_SUMMARY
+            echo "- **Behind upstream:** ${{ steps.check_diff.outputs.behind_count }} commits" >> $GITHUB_STEP_SUMMARY
+            echo "- **Ahead of upstream:** ${{ steps.check_diff.outputs.ahead_count }} commits" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            
+            if [ "${{ steps.conflict_check.outputs.merge_strategy }}" == "fast-forward" ]; then
+              echo "✅ **Result:** Successfully synced with upstream" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "⚠️ **Result:** Created PR for manual conflict resolution" >> $GITHUB_STEP_SUMMARY
+            fi
+          else
+            echo "### ✅ No Changes" >> $GITHUB_STEP_SUMMARY
+            echo "Fork is already up to date with upstream." >> $GITHUB_STEP_SUMMARY
+          fi
+
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "---" >> $GITHUB_STEP_SUMMARY
+          echo "*Next automatic sync: $(date -d '+7 days' '+%Y-%m-%d %H:%M UTC') (Weekly on Sundays)*" >> $GITHUB_STEP_SUMMARY
+
+      # Optional: Notify on sync completion
+      - name: Notify sync completion
+        if: steps.check_diff.outputs.has_changes == 'true' && steps.conflict_check.outputs.merge_strategy == 'fast-forward'
+        run: |
+          echo "🎉 Fork sync completed successfully!"
+          echo "📈 Synced ${{ steps.check_diff.outputs.behind_count }} commits from upstream"
+          echo "🔗 Repository: https://github.com/${{ github.repository }}"
